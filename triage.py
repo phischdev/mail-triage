@@ -19,6 +19,7 @@ Usage:
 import datetime as dt
 import hashlib
 import html
+import json
 import logging
 import os
 import re
@@ -54,6 +55,7 @@ DEFAULTS = {
     "corrections_in_prompt": 30,
     "move_after": 15,   # seconds after a message is seen before it is moved (Purelymail moves too soon can fail)
     "folders": {},   # topic folders: {name: {domains: [...], subject: [...]}}; matching mail is filed there, not Later
+    "export_dir": None,   # optional: append every decision as one JSON line to <dir>/YYYY-MM-DD.jsonl
 }
 
 log = logging.getLogger("triage")
@@ -428,6 +430,9 @@ class Account(threading.Thread):
         self.spec = spec
         self.user, self.host = spec["user"], spec["host"]
         self.port = spec.get("port", 993)
+        # ssl: false for a server on a trusted local link that speaks plain IMAP, e.g. an OAuth
+        # proxy such as email-oauth2-proxy in front of Outlook/Microsoft 365
+        self.ssl = spec.get("ssl", True)
         self.password = os.environ.get(spec["password_env"], "")
         self.later = CFG["later_folder"]
         self.move = spec.get("move", True)   # false: classify + push only, never touch the mailbox
@@ -439,7 +444,7 @@ class Account(threading.Thread):
         self.seen_at = 0.0   # when process_new last found new mail (move_after counts from here)
 
     def connect(self):
-        c = IMAPClient(self.host, port=self.port, ssl=True, timeout=90)
+        c = IMAPClient(self.host, port=self.port, ssl=self.ssl, timeout=90)
         c.login(self.user, self.password)
         return c
 
@@ -556,6 +561,7 @@ class Account(threading.Thread):
           tier, out["category"], out["summary"], out["reason"], int(out["phishing"]), int(m["bulk"]),
           notified, applied, int(out.get("emergency", False)))
         log.info("%-5s %-28s %s | %s", tier.upper(), m["sender"][:28], m["subject"][:60], out["reason"])
+        export(self.user, m, out, known, reply_to_me)
         try:
             secretary.record(self.spec, m, out, tier)
         except Exception:
@@ -662,6 +668,29 @@ def record_failure(account, uid, raw, err):
       account, m["msgid"], now().isoformat(), m["sender"], m["sender_name"], m["subject"],
       "today", "unsorted", f"Could not be sorted: {m['subject'][:70]}", f"error: {type(err).__name__}",
       0, int(m["bulk"]), None, 0)
+
+
+def export(account, m, out, known, reply_to_me):
+    """Optional (config export_dir): one JSON line per decision, a file per day, for another
+    program (a dashboard, an assistant) that should see the verdicts but never the mail itself.
+    The body is not written; the summary is the model's. Failures are logged, never raised."""
+    d = CFG.get("export_dir")
+    if not d:
+        return
+    rec = {"ts": now().isoformat(), "account": account, "msgid": m["msgid"], "date": m["date"],
+           "sender": m["sender"], "sender_name": m["sender_name"], "to": m["to"], "subject": m["subject"],
+           "tier": out["tier"], "category": out["category"], "summary": out["summary"],
+           "reason": out["reason"], "phishing": bool(out["phishing"]),
+           "emergency": bool(out.get("emergency", False)), "folder": out.get("folder"),
+           "bulk": m["bulk"], "known_sender": known, "reply_to_my_thread": reply_to_me,
+           "auth": m["auth"], "shadow": bool(CFG["shadow"])}
+    try:
+        path = Path(d) / f"{now().date().isoformat()}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with _lock, open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except OSError as e:
+        log.error("export failed for %s: %s", m["msgid"], e)
 
 
 def push_now(account, m, out):

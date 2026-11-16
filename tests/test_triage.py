@@ -287,3 +287,44 @@ def test_a_move_waits_until_delivery_has_settled(env, monkeypatch):
     a.seen_at, slept[:] = triage.time.time() - 60, []
     a.handle(c, 2, RAW.replace(b"Subject:", b"Message-ID: <two@x>\r\nSubject:"))
     assert slept == []
+
+
+def test_export_writes_one_json_line_per_decision_without_the_body(env, tmp_path):
+    import json
+    triage, llm, notify = env
+    triage.CFG["export_dir"] = tmp_path / "export"
+    triage.CFG["shadow"] = True
+    a = triage.Account({"user": "a@x.com", "host": "h", "password_env": "P"})
+    llm.reply.update(tier="today", summary="Pay the invoice by Friday")
+    a.handle(FolderIMAP(), 1, RAW)
+    files = list((tmp_path / "export").glob("*.jsonl"))
+    assert len(files) == 1
+    rec = json.loads(files[0].read_text().splitlines()[0])
+    assert rec["account"] == "a@x.com" and rec["tier"] == "today" and rec["shadow"] is True
+    assert rec["summary"] == "Pay the invoice by Friday"
+    assert "body" not in rec
+
+
+def test_export_is_off_by_default(env, tmp_path):
+    triage, llm, notify = env
+    a = triage.Account({"user": "a@x.com", "host": "h", "password_env": "P"})
+    a.handle(FolderIMAP(), 1, RAW)
+    assert not list(tmp_path.glob("**/*.jsonl"))
+
+
+def test_plain_imap_for_a_local_proxy(env, monkeypatch):
+    triage, llm, notify = env
+    seen = {}
+
+    class Fake:
+        def __init__(self, host, port, ssl, timeout):
+            seen.update(host=host, port=port, ssl=ssl)
+
+        def login(self, user, password):
+            pass
+
+    monkeypatch.setattr(triage, "IMAPClient", Fake)
+    triage.Account({"user": "a@x.com", "host": "proxy", "port": 1993, "ssl": False, "password_env": "P"}).connect()
+    assert seen == {"host": "proxy", "port": 1993, "ssl": False}
+    triage.Account({"user": "a@x.com", "host": "h", "password_env": "P"}).connect()
+    assert seen["ssl"] is True

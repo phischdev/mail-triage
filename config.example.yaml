@@ -69,6 +69,8 @@ later_folder: Later
 #   listen: 0.0.0.0:8941             # inside the container; publish as 127.0.0.1:8941:8941
 #   token_env: TRIAGE_ACTIONS_TOKEN  # Authorization: Bearer <token> on every request
 body_chars: 2500                   # how much of each body the model sees
+# export_dir: /export               # optional: every decision as one JSON line in <dir>/YYYY-MM-DD.jsonl
+                                   # (no body; for an assistant or dashboard that should see verdicts only)
 # Optional: your secretary. Mail that asks you to do something becomes a to-do, appointments
 # and bookings become calendar events, on any CalDAV server (Radicale, Nextcloud, Fastmail...).
 # Ticking a to-do off in your app marks its email read (secretary.py).
@@ -81,6 +83,8 @@ body_chars: 2500                   # how much of each body the model sees
 accounts:
   - {user: alex@gmail.com,   host: imap.gmail.com,    password_env: PW_ALEX_GMAIL}   # an app password
   - {user: alex@example.com, host: imap.fastmail.com, password_env: PW_ALEX_WORK}
+  # ssl: false    -> plain IMAP on a trusted local link, e.g. an OAuth proxy in front of Microsoft 365
+  # - {user: me@outlook.com, host: oauth-proxy, port: 1993, ssl: false, password_env: PW_PROXY}
   # move: false  -> classify and push only; never move or flag (e.g. a box a CRM also reads)
   - {user: info@example.com, host: imap.fastmail.com, password_env: PW_INFO, move: false}
 

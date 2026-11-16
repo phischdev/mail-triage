@@ -40,7 +40,7 @@ def main(argv):
         raise SystemExit(f"refusing to fold INBOX or {later} itself")
 
     def connect():
-        c = IMAPClient(spec["host"], port=spec.get("port", 993), ssl=True, timeout=300)
+        c = IMAPClient(spec["host"], port=spec.get("port", 993), ssl=spec.get("ssl", True), timeout=300)
         c.login(user, os.environ[spec["password_env"]])
         return c
 
