@@ -14,6 +14,7 @@ Usage:
   triage.py try <account> [N]         classify the last N INBOX messages and print, no side effects
   triage.py digest [daily|weekly]     send a digest now
   triage.py contacts                  refresh the known-correspondents list from Sent folders + address book
+  triage.py review [DAYS] [ACCOUNT] [FOLDER...]  sort mail of the last DAYS once (read only, no pushes, export review=true)
   triage.py backfill [DAYS]           to-dos/events for unread now/today mail already in INBOX (caldav)
 """
 import datetime as dt
@@ -445,6 +446,7 @@ class Account(threading.Thread):
         self.move = spec.get("move", True)   # false: classify + push only, never touch the mailbox
         self.watch = list(spec.get("watch") or [])   # extra folders to sort (read only), e.g. alias folders, Junk
         self.folder = "INBOX"
+        self.reviewing = False   # cmd_review: old mail is sorted and exported, never pushed or moved
         self.failing_since = None
         self.alerted = False
         self.last_corrections = 0
@@ -533,6 +535,7 @@ class Account(threading.Thread):
     def handle(self, c, uid, raw):
         m = describe(raw, CFG["body_chars"])
         m["mailbox"] = self.folder
+        m["review"] = self.reviewing
         if q("SELECT 1 FROM messages WHERE account=? AND msgid=?", self.user, m["msgid"]):
             return
         known = bool(q("SELECT 1 FROM contacts WHERE addr=?", m["sender"]))
@@ -560,7 +563,7 @@ class Account(threading.Thread):
             out["reason"] += f" (quiet: {dest})"
         tier = out["tier"]
         applied = 0
-        if not CFG["shadow"] and self.move and self.folder == "INBOX":
+        if not CFG["shadow"] and self.move and self.folder == "INBOX" and not self.reviewing:
             if tier == "later" or (tier == "today" and dest):
                 # topic mail goes to its own folder; "now" stays in INBOX, flagged, whatever the topic
                 if dest:
@@ -575,7 +578,7 @@ class Account(threading.Thread):
                 c.add_flags([uid], [b"\\Flagged"])
                 applied = 1
         notified = None
-        if tier == "now":
+        if tier == "now" and not self.reviewing:
             # quiet hours hold urgent mail till morning, but never an emergency
             held = in_quiet_hours() and not out.get("emergency")
             notified = "held" if held else ("sent" if push_now(self.user, m, out) else "failed")
@@ -721,7 +724,7 @@ def export(account, m, out, known, reply_to_me):
            "bulk": m["bulk"], "known_sender": known, "reply_to_my_thread": reply_to_me,
            "auth": m["auth"], "auth_pass": auth_pass(m["auth"]),
            "deadline": out.get("deadline"), "deadline_text": out.get("deadline_text"),
-           "shadow": bool(CFG["shadow"])}
+           "shadow": bool(CFG["shadow"]), "review": bool(m.get("review"))}
     try:
         path = Path(d) / f"{now().date().isoformat()}.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -871,6 +874,36 @@ def cmd_try(user, n=10):
     c.logout()
 
 
+def cmd_review(days=60, account=None, *folders):
+    """Sort the mail of the last `days` days once, in INBOX and the account's watch folders (or
+    the folders named), oldest first. Read only: nothing is moved, flagged or pushed; rows and the
+    export are written as for new mail, export lines marked review=true. Mail already sorted is
+    skipped, so an interrupted run can simply be started again."""
+    since = (now() - dt.timedelta(days=int(days))).date()
+    for spec in CFG["accounts"]:
+        if account and spec["user"] != account:
+            continue
+        a = Account(spec)
+        a.reviewing = True
+        c = a.connect()
+        if time.time() - a.last_contacts > 86400:
+            a.refresh_contacts(c)
+        for folder in (folders or ["INBOX", *a.watch]):
+            c.select_folder(folder, readonly=True)
+            a.folder = folder
+            uids = sorted(c.search(["SINCE", since]))
+            log.info("review %s %s: %d messages since %s", spec["user"], folder, len(uids), since)
+            for uid in uids:
+                raw = c.fetch([uid], ["BODY.PEEK[]<0.300000>"]).get(uid, {})
+                raw = raw.get(b"BODY[]<0>") or next((v for k, v in raw.items() if k.startswith(b"BODY[")), b"")
+                if raw:
+                    try:
+                        a.handle(c, uid, raw)
+                    except Exception as e:
+                        log.error("review uid %s in %s failed: %s", uid, folder, e)
+        c.logout()
+
+
 def cmd_backfill(days=14):
     """Re-read unread now/today mail still in INBOX and queue its to-dos and events. Tiers
     are left as they were; only the new fields are used."""
@@ -918,6 +951,8 @@ def main():
             a.refresh_contacts(c)
             c.logout()
         return None
+    if cmd == "review":
+        return cmd_review(*sys.argv[2:])
     if cmd == "backfill":
         return cmd_backfill(*sys.argv[2:])
     if cmd == "digest":

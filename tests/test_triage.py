@@ -385,3 +385,19 @@ def test_watched_folders_are_sorted_read_only_and_never_moved(env, tmp_path):
     rec = json.loads(next((tmp_path / "export").glob("*.jsonl")).read_text().splitlines()[0])
     assert rec["mailbox"] == "adm"
     assert triage.q("SELECT last_uid FROM cursor WHERE account=?", "a@x.com|adm")[0][0] == 5
+
+
+def test_review_sorts_old_mail_once_without_moving_or_pushing(env, tmp_path, monkeypatch):
+    import json
+    triage, llm, notify = env
+    triage.CFG["export_dir"] = tmp_path / "export"
+    c = WatchIMAP({"INBOX": {3: RAW}, "adm": {}})
+    monkeypatch.setattr(triage.Account, "connect", lambda self: c)
+    monkeypatch.setattr(triage.Account, "refresh_contacts", lambda self, c: None)
+    c.logout = lambda: None
+    llm.reply.update(tier="now")
+    triage.cmd_review(60)
+    triage.cmd_review(60)   # again: already sorted, skipped
+    assert c.moves == [] and c.flags == [] and not notify.sent and len(llm.calls) == 1
+    rec = json.loads(next((tmp_path / "export").glob("*.jsonl")).read_text().splitlines()[0])
+    assert rec["review"] is True and rec["tier"] == "now"
