@@ -351,3 +351,37 @@ def test_auth_pass():
     assert triage.auth_pass("mx; dmarc=pass") is True
     assert triage.auth_pass("mx; spf=pass; dkim=fail; dmarc=fail") is False
     assert triage.auth_pass("mx; spf=softfail") is False
+
+
+class WatchIMAP(FolderIMAP):
+    """Two folders: INBOX (empty) and an alias folder a server-side rule fills."""
+    def __init__(self, raw_by_folder):
+        super().__init__()
+        self.raw_by_folder, self.selected = raw_by_folder, []
+        self.current = "INBOX"
+    def select_folder(self, folder, readonly=False):
+        self.selected.append((folder, readonly))
+        self.current = folder
+        return {b"UIDVALIDITY": 7}
+    def search(self, crit):
+        return sorted(self.raw_by_folder.get(self.current, {}))
+    def fetch(self, uids, parts):
+        return {u: {b"BODY[]<0>": self.raw_by_folder[self.current][u]} for u in uids}
+
+
+def test_watched_folders_are_sorted_read_only_and_never_moved(env, tmp_path):
+    import json
+    triage, llm, notify = env
+    triage.CFG["export_dir"] = tmp_path / "export"
+    a = triage.Account({"user": "a@x.com", "host": "h", "password_env": "P", "watch": ["adm"]})
+    c = WatchIMAP({"INBOX": {}, "adm": {}})
+    a.process_new(c)          # cursors start at "now"
+    a.process_watched(c)
+    c.raw_by_folder["adm"][5] = RAW
+    llm.reply.update(tier="later")
+    a.process_watched(c)
+    assert ("adm", True) in c.selected and c.selected[-1] == ("INBOX", False)
+    assert c.moves == [] and c.flags == []
+    rec = json.loads(next((tmp_path / "export").glob("*.jsonl")).read_text().splitlines()[0])
+    assert rec["mailbox"] == "adm"
+    assert triage.q("SELECT last_uid FROM cursor WHERE account=?", "a@x.com|adm")[0][0] == 5

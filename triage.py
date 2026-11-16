@@ -443,6 +443,8 @@ class Account(threading.Thread):
         self.password = os.environ.get(spec["password_env"], "")
         self.later = CFG["later_folder"]
         self.move = spec.get("move", True)   # false: classify + push only, never touch the mailbox
+        self.watch = list(spec.get("watch") or [])   # extra folders to sort (read only), e.g. alias folders, Junk
+        self.folder = "INBOX"
         self.failing_since = None
         self.alerted = False
         self.last_corrections = 0
@@ -485,15 +487,20 @@ class Account(threading.Thread):
         self.last_contacts = time.time()
 
     # -- new mail -----------------------------------------------------------
-    def process_new(self, c):
-        info = c.select_folder("INBOX")
+    def process_new(self, c, folder="INBOX"):
+        """Sort new mail in one folder. INBOX is the account's own cursor; folders listed under
+        `watch` (filled by server-side rules, or Junk) get their own and are only read: mail
+        there is classified and exported, never moved or flagged."""
+        info = c.select_folder(folder, readonly=folder != "INBOX")
         uv = info[b"UIDVALIDITY"]
-        cur = q("SELECT uidvalidity, last_uid FROM cursor WHERE account=?", self.user)
+        key = self.user if folder == "INBOX" else f"{self.user}|{folder}"
+        self.folder = folder
+        cur = q("SELECT uidvalidity, last_uid FROM cursor WHERE account=?", key)
         if not cur or cur[0][0] != uv:
             # First start (or mailbox rebuilt): start from now, never re-sort old mail.
             top = max(c.search(["ALL"]) or [0])
-            q("INSERT OR REPLACE INTO cursor VALUES (?,?,?)", self.user, uv, top)
-            log.info("cursor initialised at uid %s", top)
+            q("INSERT OR REPLACE INTO cursor VALUES (?,?,?)", key, uv, top)
+            log.info("cursor initialised at uid %s (%s)", top, folder)
             return
         last = cur[0][1]
         uids = [u for u in c.search(["UID", f"{last + 1}:*"]) if u > last]
@@ -512,10 +519,20 @@ class Account(threading.Thread):
                     # in the digest. A failure here must surface, not disappear.
                     log.exception("uid %s failed; recording it for the digest", uid)
                     record_failure(self.user, uid, raw, e)
-            q("UPDATE cursor SET last_uid=? WHERE account=?", uid, self.user)
+            q("UPDATE cursor SET last_uid=? WHERE account=?", uid, key)
+
+    def process_watched(self, c):
+        for folder in self.watch:
+            try:
+                self.process_new(c, folder)
+            except Exception as e:
+                log.error("watched folder %s: %s: %s", folder, type(e).__name__, e)
+        if self.watch:
+            c.select_folder("INBOX")
 
     def handle(self, c, uid, raw):
         m = describe(raw, CFG["body_chars"])
+        m["mailbox"] = self.folder
         if q("SELECT 1 FROM messages WHERE account=? AND msgid=?", self.user, m["msgid"]):
             return
         known = bool(q("SELECT 1 FROM contacts WHERE addr=?", m["sender"]))
@@ -543,7 +560,7 @@ class Account(threading.Thread):
             out["reason"] += f" (quiet: {dest})"
         tier = out["tier"]
         applied = 0
-        if not CFG["shadow"] and self.move:
+        if not CFG["shadow"] and self.move and self.folder == "INBOX":
             if tier == "later" or (tier == "today" and dest):
                 # topic mail goes to its own folder; "now" stays in INBOX, flagged, whatever the topic
                 if dest:
@@ -623,6 +640,7 @@ class Account(threading.Thread):
             if time.time() - self.last_contacts > 86400:
                 self.refresh_contacts(c)
             self.process_new(c)
+            self.process_watched(c)
             self.failing_since = None
             LAST_OK[self.user] = time.time()
             started = time.time()
@@ -631,6 +649,7 @@ class Account(threading.Thread):
                 c.idle_check(timeout=240)
                 c.idle_done()
                 self.process_new(c)
+                self.process_watched(c)
                 secretary.mark_read(self.user, self.move, c)
                 if time.time() - self.last_replies > secretary.POLL:
                     secretary.check_replies(self.user, c)
@@ -693,7 +712,8 @@ def export(account, m, out, known, reply_to_me):
     d = CFG.get("export_dir")
     if not d:
         return
-    rec = {"ts": now().isoformat(), "account": account, "msgid": m["msgid"], "date": m["date"],
+    rec = {"ts": now().isoformat(), "account": account, "mailbox": m.get("mailbox", "INBOX"),
+           "msgid": m["msgid"], "date": m["date"],
            "sender": m["sender"], "sender_name": m["sender_name"], "to": m["to"], "subject": m["subject"],
            "tier": out["tier"], "category": out["category"], "summary": out["summary"],
            "reason": out["reason"], "phishing": bool(out["phishing"]),
