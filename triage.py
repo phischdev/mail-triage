@@ -336,8 +336,15 @@ def schema():
                                          "in hospital; fire, flood, a break-in or similar at their home; a person in danger. "
                                          "Never money, deadlines, outages, fraud or security alerts, or anything a company "
                                          "calls urgent. Almost always false."},
+            "deadline": {"type": ["string", "null"],
+                         "description": f"ISO date YYYY-MM-DD by which {owner} must act (pay, apply, reply, "
+                                        "register), only if the email states or clearly implies one; else null. "
+                                        "Not the date of an event they merely attend, not marketing 'offer ends'."},
+            "deadline_text": {"type": ["string", "null"],
+                              "description": "Under 50 characters, what is due, e.g. 'application by 30 Nov'; "
+                                             "null when deadline is null"},
         },
-        "required": ["tier", "category", "summary", "reason", "phishing", "emergency"],
+        "required": ["tier", "category", "summary", "reason", "phishing", "emergency", "deadline", "deadline_text"],
         "additionalProperties": False,
     }
     folders = CFG.get("folders") or {}
@@ -670,6 +677,15 @@ def record_failure(account, uid, raw, err):
       0, int(m["bulk"]), None, 0)
 
 
+def auth_pass(auth):
+    """The receiving server's verdict from Authentication-Results: True when DMARC passed (or SPF
+    and DKIM both did), False when any of them failed or nothing passed, None without the header."""
+    a = (auth or "").lower()
+    if not a:
+        return None
+    return "dmarc=pass" in a or ("spf=pass" in a and "dkim=pass" in a)
+
+
 def export(account, m, out, known, reply_to_me):
     """Optional (config export_dir): one JSON line per decision, a file per day, for another
     program (a dashboard, an assistant) that should see the verdicts but never the mail itself.
@@ -683,7 +699,9 @@ def export(account, m, out, known, reply_to_me):
            "reason": out["reason"], "phishing": bool(out["phishing"]),
            "emergency": bool(out.get("emergency", False)), "folder": out.get("folder"),
            "bulk": m["bulk"], "known_sender": known, "reply_to_my_thread": reply_to_me,
-           "auth": m["auth"], "shadow": bool(CFG["shadow"])}
+           "auth": m["auth"], "auth_pass": auth_pass(m["auth"]),
+           "deadline": out.get("deadline"), "deadline_text": out.get("deadline_text"),
+           "shadow": bool(CFG["shadow"])}
     try:
         path = Path(d) / f"{now().date().isoformat()}.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)

@@ -328,3 +328,26 @@ def test_plain_imap_for_a_local_proxy(env, monkeypatch):
     assert seen == {"host": "proxy", "port": 1993, "ssl": False}
     triage.Account({"user": "a@x.com", "host": "h", "password_env": "P"}).connect()
     assert seen["ssl"] is True
+
+
+def test_export_carries_deadline_and_auth_verdict(env, tmp_path):
+    import json
+    triage, llm, notify = env
+    triage.CFG["export_dir"] = tmp_path / "export"
+    llm.reply.update(deadline="2026-11-30", deadline_text="application by 30 Nov")
+    a = triage.Account({"user": "a@x.com", "host": "h", "password_env": "P"})
+    a.handle(FolderIMAP(), 1, RAW)
+    rec = json.loads(next((tmp_path / "export").glob("*.jsonl")).read_text().splitlines()[0])
+    assert rec["deadline"] == "2026-11-30" and rec["deadline_text"] == "application by 30 Nov"
+    assert rec["auth_pass"] is None   # RAW has no Authentication-Results
+    schema = triage.schema()
+    assert {"deadline", "deadline_text"} <= set(schema["required"])
+
+
+def test_auth_pass():
+    import triage
+    assert triage.auth_pass("") is None
+    assert triage.auth_pass("mx.example; spf=pass smtp.mailfrom=x; dkim=pass header.d=x; dmarc=pass") is True
+    assert triage.auth_pass("mx; dmarc=pass") is True
+    assert triage.auth_pass("mx; spf=pass; dkim=fail; dmarc=fail") is False
+    assert triage.auth_pass("mx; spf=softfail") is False
