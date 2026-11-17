@@ -106,7 +106,9 @@ def by_email(spec: dict, mailto: str, send=None) -> str:
         send(msg)
         return to
     host = spec.get("smtp_host") or spec["host"].replace("imap.", "smtp.", 1)
-    with smtplib.SMTP_SSL(host, spec.get("smtp_port", 465), timeout=30) as s:
+    # smtp_ssl: false for a local relay such as an OAuth proxy that speaks plain SMTP
+    smtp = smtplib.SMTP_SSL if spec.get("smtp_ssl", True) else smtplib.SMTP
+    with smtp(host, spec.get("smtp_port", 465), timeout=30) as s:
         s.login(spec["user"], os.environ.get(spec["password_env"], ""))
         s.send_message(msg)
     return to

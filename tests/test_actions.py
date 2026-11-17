@@ -429,3 +429,26 @@ def test_crm_box_later_mail_shows_under_later_not_inbox(ax, monkeypatch):
     later = {m["msgid"] for m in actions.list_folder("later", 14)["items"]}
     assert inbox == {"<lead@1>", "<own@1>"}   # an ordinary box's own INBOX is shown as is
     assert later == {"<ig@1>"}
+
+
+def test_api_allow_list_limits_the_endpoints(ax, monkeypatch):
+    monkeypatch.setenv("T", "secret")
+    server = actions.start({"listen": "127.0.0.1:0", "token_env": "T", "allow": ["unsubscribe"]}, ax)
+    url = f"http://127.0.0.1:{server.server_address[1]}"
+    auth = {"Authorization": "Bearer secret", "Content-Type": "application/json"}
+    try:
+        with pytest.raises(urllib.error.HTTPError) as e:
+            urllib.request.urlopen(urllib.request.Request(f"{url}/accounts", headers=auth))
+        assert e.value.code == 403
+        with pytest.raises(urllib.error.HTTPError) as e:
+            urllib.request.urlopen(urllib.request.Request(f"{url}/move", b'{"account":"a@x.com","msgid":"<a@1>","to":"later"}', auth))
+        assert e.value.code == 403
+        with pytest.raises(urllib.error.HTTPError) as e:   # allowed, but no sender given: 400, not 403
+            urllib.request.urlopen(urllib.request.Request(f"{url}/unsubscribe", b'{"account":"a@x.com"}', auth))
+        assert e.value.code == 400
+        with pytest.raises(urllib.error.HTTPError) as e:   # the token still counts
+            urllib.request.urlopen(urllib.request.Request(f"{url}/unsubscribe", b"{}", {"Content-Type": "application/json"}))
+        assert e.value.code == 401
+    finally:
+        server.shutdown()
+        actions.Handler.allow = None

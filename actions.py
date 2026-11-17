@@ -4,6 +4,8 @@ what is sitting in each account's spam folder. Off unless `actions:` is configur
     actions:
       listen: 0.0.0.0:8941              # publish it on loopback or a private network only
       token_env: TRIAGE_ACTIONS_TOKEN   # every request needs "Authorization: Bearer <token>"
+      allow: [unsubscribe]              # optional: only these endpoints (by name), e.g. for an
+                                        # assistant that may unsubscribe but not read or move mail
 
     GET  /accounts                 [{"user", "move"}]
     GET  /spam?days=30             [{"account", "msgid", "sender", "sender_name", "subject", "date"}]
@@ -547,7 +549,8 @@ def unsubscribe(account, sender, connect=None, post=None, send=None):
     since = triage.now().date() - dt.timedelta(days=120)
     newest = None   # (date, raw headers)
     with imap(spec, connect) as c:
-        for f in (triage.CFG["later_folder"], "INBOX"):
+        # its mail may sit in a watched folder (an alias filed by a server rule) instead of the inbox
+        for f in (triage.CFG["later_folder"], "INBOX", *spec.get("watch", [])):
             if f != "INBOX" and not c.folder_exists(f):
                 continue
             c.select_folder(f, readonly=True)
@@ -591,6 +594,7 @@ def days(qs, default):
 
 class Handler(BaseHTTPRequestHandler):
     token = ""
+    allow = None   # None: every endpoint; else a set of endpoint names ("unsubscribe", "spam", ...)
 
     def log_message(self, fmt, *args):
         log.debug(fmt, *args)
@@ -607,9 +611,14 @@ class Handler(BaseHTTPRequestHandler):
         got = self.headers.get("Authorization", "").removeprefix("Bearer ").strip()
         return bool(self.token) and hmac.compare_digest(got.encode(), self.token.encode())
 
+    def _allowed(self):
+        return self.allow is None or urlparse(self.path).path.strip("/") in self.allow
+
     def _handle(self, fn):
         if not self._authorized():
             return self._send(401, {"error": "unauthorized"})
+        if not self._allowed():
+            return self._send(403, {"error": "this endpoint is not enabled"})
         try:
             return self._send(200, fn())
         except ActionError as e:
@@ -620,6 +629,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         url = urlparse(self.path)
+        if not self._allowed():
+            return self._send(403 if self._authorized() else 401,
+                              {"error": "this endpoint is not enabled" if self._authorized() else "unauthorized"})
         if url.path == "/accounts":
             return self._handle(lambda: [{"user": a["user"], "move": a.get("move", True)}
                                          for a in triage.CFG["accounts"]])
@@ -695,6 +707,7 @@ def start(cfg, triage_module):
         return None
     host, _, port = cfg.get("listen", "127.0.0.1:8941").rpartition(":")
     Handler.token = token
+    Handler.allow = set(cfg["allow"]) if cfg.get("allow") is not None else None
     server = ThreadingHTTPServer((host or "127.0.0.1", int(port)), Handler)
     threading.Thread(target=server.serve_forever, name="actions", daemon=True).start()
     log.info("actions API listening on %s:%s", host, port)

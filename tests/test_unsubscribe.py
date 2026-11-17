@@ -110,3 +110,29 @@ def test_one_click_never_reaches_inside_the_network(monkeypatch):
         assert not unsub.public_https(url), url
     with pytest.raises(unsub.UnsubError):
         unsub.one_click("https://inside.example/u")
+
+
+def test_mailto_can_go_through_a_plain_smtp_relay(monkeypatch):
+    import smtplib
+
+    import unsubscribe as unsub
+    used = []
+    class FakeSMTP:
+        def __init__(self, host, port, timeout):
+            used.append((host, port))
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+        def login(self, user, password):
+            pass
+        def send_message(self, msg):
+            used.append(msg["To"])
+    def no_ssl(*a, **k):
+        raise AssertionError("SMTP_SSL must not be used for a plain relay")
+    monkeypatch.setattr(smtplib, "SMTP", FakeSMTP)
+    monkeypatch.setattr(smtplib, "SMTP_SSL", no_ssl)
+    spec = {"user": "a@x.com", "host": "proxy", "password_env": "P",
+            "smtp_host": "proxy", "smtp_port": 1587, "smtp_ssl": False}
+    assert unsub.by_email(spec, "mailto:leave@list.example?subject=unsubscribe") == "leave@list.example"
+    assert used == [("proxy", 1587), "leave@list.example"]
