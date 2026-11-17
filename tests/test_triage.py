@@ -518,7 +518,9 @@ def test_webhook_notifier_signs_ops_alerts(monkeypatch):
     n = notifiers.make({"type": "webhook", "url": "https://ops.example/hook", "secret_env": "OPS_SECRET"})
     assert n.send("mail-triage: sorting paused", "spend cap", "normal")
     h = {k.lower(): v for k, v in sent[0].header_items()}
-    assert json.loads(sent[0].data) == {"title": "mail-triage: sorting paused", "message": "spend cap", "level": "normal"}
+    assert json.loads(sent[0].data) == {"source": "mail-triage", "event": "sorting_paused",
+                                        "title": "mail-triage: sorting paused", "text": "spend cap",
+                                        "message": "spend cap", "level": "normal"}
     want = base64.b64encode(hmac.new(b"plain-secret", f"{h['webhook-id']}.{h['webhook-timestamp']}.".encode()
                                      + sent[0].data, hashlib.sha256).digest()).decode()
     assert h["webhook-signature"] == f"v1,{want}"

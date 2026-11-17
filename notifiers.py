@@ -10,6 +10,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import time
 import urllib.parse
 import urllib.request
@@ -100,14 +101,17 @@ def post_signed(url, body, secret, msg_id):
 
 
 class Webhook(Notifier):
-    """type: webhook. POSTs {title, message, level, url} to `url`, signed per Standard Webhooks with
+    """type: webhook. POSTs {source, event, title, text, message, level, url} to `url`, signed per Standard Webhooks with
     the secret in `secret_env`; for an assistant or ops bot that should act on it."""
 
     def _send(self, title, message, level, url):
         secret = self.secret("secret_env")
         if not secret:
             raise RuntimeError(f"no secret in {self.cfg.get('secret_env')}")
-        body = {"title": title, "message": message, "level": level, **({"url": url} if url else {})}
+        # source/event/text: what an ops bot keys on; event is the title after "name: ", as a slug
+        event = re.sub(r"[^a-z0-9]+", "_", title.split(": ", 1)[-1].lower()).strip("_")
+        body = {"source": self.cfg.get("source", "mail-triage"), "event": event, "title": title,
+                "text": message, "message": message, "level": level, **({"url": url} if url else {})}
         msg_id = "msg_" + hashlib.sha256(f"{title}|{message}|{int(time.time()) // 60}".encode()).hexdigest()[:32]
         post_signed(self.cfg["url"], body, secret, msg_id)
 
