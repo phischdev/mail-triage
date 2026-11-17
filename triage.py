@@ -17,8 +17,10 @@ Usage:
   triage.py review [DAYS] [ACCOUNT] [FOLDER...]  sort mail of the last DAYS once (read only, no pushes, export review=true)
   triage.py backfill [DAYS]           to-dos/events for unread now/today mail already in INBOX (caldav)
 """
+import base64
 import datetime as dt
 import hashlib
+import hmac
 import html
 import json
 import logging
@@ -57,6 +59,7 @@ DEFAULTS = {
     "move_after": 15,   # seconds after a message is seen before it is moved (Purelymail moves too soon can fail)
     "folders": {},   # topic folders: {name: {domains: [...], subject: [...]}}; matching mail is filed there, not Later
     "export_dir": None,   # optional: append every decision as one JSON line to <dir>/YYYY-MM-DD.jsonl
+    "export_webhook": None,   # optional: POST now/today decisions to a URL (Standard Webhooks signature)
 }
 
 log = logging.getLogger("triage")
@@ -713,7 +716,7 @@ def export(account, m, out, known, reply_to_me):
     program (a dashboard, an assistant) that should see the verdicts but never the mail itself.
     The body is not written; the summary is the model's. Failures are logged, never raised."""
     d = CFG.get("export_dir")
-    if not d:
+    if not d and not CFG.get("export_webhook"):
         return
     rec = {"ts": now().isoformat(), "account": account, "mailbox": m.get("mailbox", "INBOX"),
            "msgid": m["msgid"], "date": m["date"],
@@ -725,13 +728,44 @@ def export(account, m, out, known, reply_to_me):
            "auth": m["auth"], "auth_pass": auth_pass(m["auth"]),
            "deadline": out.get("deadline"), "deadline_text": out.get("deadline_text"),
            "shadow": bool(CFG["shadow"]), "review": bool(m.get("review"))}
+    if d:
+        try:
+            path = Path(d) / f"{now().date().isoformat()}.jsonl"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with _lock, open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        except OSError as e:
+            log.error("export failed for %s: %s", m["msgid"], e)
+    export_webhook(rec)
+
+
+def export_webhook(rec):
+    """Optional (config export_webhook): POST a decision to a URL as it happens, signed the
+    Standard Webhooks way (webhook-id, webhook-timestamp, webhook-signature: v1,<base64 HMAC-SHA256
+    of "id.timestamp.body">), so an assistant can wake up instead of polling the export.
+      export_webhook:
+        url: https://assistant.example/webhooks/mail
+        secret_env: EXPORT_WEBHOOK_SECRET   # "whsec_<base64>" or any string
+        tiers: [now, today]                 # default; review runs never post
+    Failures are logged, never raised: the export file stays the record to catch up from."""
+    cfg = CFG.get("export_webhook")
+    if not cfg or rec.get("review") or rec["tier"] not in cfg.get("tiers", ["now", "today"]):
+        return
+    secret = os.environ.get(cfg.get("secret_env", ""), "")
+    if not secret:
+        log.error("export_webhook: no secret in %s, not posting", cfg.get("secret_env"))
+        return
+    key = base64.b64decode(secret[6:]) if secret.startswith("whsec_") else secret.encode()
+    body = json.dumps(rec, ensure_ascii=False).encode()
+    msg_id = "msg_" + hashlib.sha256((rec["account"] + rec["msgid"]).encode()).hexdigest()[:32]
+    ts = str(int(time.time()))
+    sig = base64.b64encode(hmac.new(key, f"{msg_id}.{ts}.".encode() + body, hashlib.sha256).digest()).decode()
+    req = urllib.request.Request(cfg["url"], body, {"Content-Type": "application/json", "webhook-id": msg_id,
+                                                    "webhook-timestamp": ts, "webhook-signature": f"v1,{sig}"})
     try:
-        path = Path(d) / f"{now().date().isoformat()}.jsonl"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with _lock, open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-    except OSError as e:
-        log.error("export failed for %s: %s", m["msgid"], e)
+        urllib.request.urlopen(req, timeout=10).read()
+    except Exception as e:
+        log.error("export_webhook failed for %s: %s", rec["msgid"], e)
 
 
 def push_now(account, m, out):

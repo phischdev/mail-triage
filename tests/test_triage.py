@@ -417,3 +417,45 @@ def test_review_logs_in_again_when_the_session_expires(env, tmp_path, monkeypatc
     fresh.logout = lambda: None
     triage.cmd_review(60)
     assert len(llm.calls) == 1 and ("INBOX", True) in fresh.selected
+
+
+def test_export_webhook_posts_now_and_today_signed_the_standard_webhooks_way(env, monkeypatch):
+    import base64
+    import hashlib
+    import hmac
+    import json
+    triage, llm, notify = env
+    key = b"0123456789abcdef0123456789abcdef"
+    monkeypatch.setenv("HOOK_SECRET", "whsec_" + base64.b64encode(key).decode())
+    triage.CFG["export_webhook"] = {"url": "https://assistant.example/hook", "secret_env": "HOOK_SECRET"}
+    sent = []
+    class Resp:
+        def read(self):
+            return b""
+    monkeypatch.setattr(triage.urllib.request, "urlopen", lambda req, timeout: sent.append(req) or Resp())
+    a = triage.Account({"user": "a@x.com", "host": "h", "password_env": "P"})
+    llm.reply.update(tier="later")
+    a.handle(FolderIMAP(), 1, RAW)
+    assert sent == []                      # later: not posted
+    triage.q("DELETE FROM messages")
+    llm.reply.update(tier="today", summary="Pay the invoice by Friday")
+    a.handle(FolderIMAP(), 1, RAW)
+    assert len(sent) == 1
+    req = sent[0]
+    h = {k.lower(): v for k, v in req.header_items()}
+    rec = json.loads(req.data)
+    assert rec["tier"] == "today" and rec["summary"] == "Pay the invoice by Friday" and "body" not in rec
+    signed = f"{h['webhook-id']}.{h['webhook-timestamp']}.".encode() + req.data
+    want = base64.b64encode(hmac.new(key, signed, hashlib.sha256).digest()).decode()
+    assert h["webhook-signature"] == f"v1,{want}"
+
+
+def test_export_webhook_never_posts_for_review_or_without_secret(env, monkeypatch):
+    triage, llm, notify = env
+    triage.CFG["export_webhook"] = {"url": "https://assistant.example/hook", "secret_env": "MISSING"}
+    sent = []
+    monkeypatch.setattr(triage.urllib.request, "urlopen", lambda req, timeout: sent.append(req))
+    triage.export_webhook({"tier": "now", "review": False, "account": "a", "msgid": "<m>"})
+    monkeypatch.setenv("MISSING", "s3cret")
+    triage.export_webhook({"tier": "now", "review": True, "account": "a", "msgid": "<m>"})
+    assert sent == []
