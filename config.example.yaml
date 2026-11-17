@@ -77,6 +77,11 @@ body_chars: 2500                   # how much of each body the model sees
 #   secret_env: EXPORT_WEBHOOK_SECRET
 #   tiers: [now, today]
 #   categories: [confirmation]      # optional: also post these categories at any tier
+#   # or, for Hermes Agent: every mail as a new turn of ONE ongoing conversation instead
+#   type: hermes_run
+#   url: http://hermes:8642/p/inbox/v1/runs
+#   key_env: HERMES_API_KEY         # the profile's API_SERVER_KEY
+#   session_key: mail-eingang       # names the conversation
 # Optional: your secretary. Mail that asks you to do something becomes a to-do, appointments
 # and bookings become calendar events, on any CalDAV server (Radicale, Nextcloud, Fastmail...).
 # Ticking a to-do off in your app marks its email read (secretary.py).
