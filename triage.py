@@ -17,10 +17,8 @@ Usage:
   triage.py review [DAYS] [ACCOUNT] [FOLDER...]  sort mail of the last DAYS once (read only, no pushes, export review=true)
   triage.py backfill [DAYS]           to-dos/events for unread now/today mail already in INBOX (caldav)
 """
-import base64
 import datetime as dt
 import hashlib
-import hmac
 import html
 import json
 import logging
@@ -507,6 +505,8 @@ class Account(threading.Thread):
             q("INSERT OR REPLACE INTO cursor VALUES (?,?,?)", key, uv, top)
             log.info("cursor initialised at uid %s (%s)", top, folder)
             return
+        if time.time() < PAUSED["until"]:
+            return
         last = cur[0][1]
         uids = [u for u in c.search(["UID", f"{last + 1}:*"]) if u > last]
         self.seen_at = time.time()
@@ -519,6 +519,9 @@ class Account(threading.Thread):
             else:
                 try:
                     self.handle(c, uid, raw)
+                except providers.Paused as e:
+                    pause(e)
+                    return   # cursor stays before this message: it is sorted once the pause is over
                 except Exception as e:
                     # Never advance past a message without a row: the row is what puts it
                     # in the digest. A failure here must surface, not disappear.
@@ -551,6 +554,8 @@ class Account(threading.Thread):
                        "reason": "sent by dispatch, already handled", "phishing": False, "emergency": False}
             else:
                 out = classify(self.user, m, known, reply_to_me)
+        except providers.Paused:
+            raise   # not this message's fault: leave it unsorted-free, the cursor stays before it
         except Exception as e:
             # Fail open: unclassified mail stays in the inbox and shows up in the digest.
             log.error("classify failed for %s: %s", m["msgid"], e)
@@ -689,6 +694,23 @@ class Account(threading.Thread):
                 backoff = min(backoff * 2, 600)
 
 
+PAUSED = {"until": 0.0}
+PAUSE_SECONDS = 600
+
+
+def pause(err):
+    """The model service refuses for now (spend cap). Stop sorting for PAUSE_SECONDS on every
+    account, then try again; tell the ops channel once a day so someone can raise the cap."""
+    PAUSED["until"] = time.time() + PAUSE_SECONDS
+    log.warning("sorting paused for %d min: %s", PAUSE_SECONDS // 60, err)
+    day = now().date().isoformat()
+    if kv_get("paused_alert") != day:
+        kv_set("paused_alert", day)
+        OPS.send("mail-triage: sorting paused",
+                 "The model service refuses (spend cap or quota reached). New mail waits and is sorted "
+                 f"once it answers again; retrying every {PAUSE_SECONDS // 60} min.", "normal")
+
+
 def record_failure(account, uid, raw, err):
     try:
         m = describe(raw, CFG["body_chars"])
@@ -755,15 +777,9 @@ def export_webhook(rec):
     if not secret:
         log.error("export_webhook: no secret in %s, not posting", cfg.get("secret_env"))
         return
-    key = base64.b64decode(secret[6:]) if secret.startswith("whsec_") else secret.encode()
-    body = json.dumps(rec, ensure_ascii=False).encode()
     msg_id = "msg_" + hashlib.sha256((rec["account"] + rec["msgid"]).encode()).hexdigest()[:32]
-    ts = str(int(time.time()))
-    sig = base64.b64encode(hmac.new(key, f"{msg_id}.{ts}.".encode() + body, hashlib.sha256).digest()).decode()
-    req = urllib.request.Request(cfg["url"], body, {"Content-Type": "application/json", "webhook-id": msg_id,
-                                                    "webhook-timestamp": ts, "webhook-signature": f"v1,{sig}"})
     try:
-        urllib.request.urlopen(req, timeout=10).read()
+        notifiers.post_signed(cfg["url"], rec, secret, msg_id)
     except Exception as e:
         log.error("export_webhook failed for %s: %s", rec["msgid"], e)
 
@@ -941,6 +957,9 @@ def cmd_review(days=60, account=None, *folders):
                 if raw:
                     try:
                         a.handle(c, uid, raw)
+                    except providers.Paused as e:
+                        pause(e)
+                        raise SystemExit(f"review paused: {e}") from None
                     except Exception as e:
                         log.error("review uid %s in %s failed: %s", uid, folder, e)
         c.logout()

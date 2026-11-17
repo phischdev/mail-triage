@@ -36,7 +36,8 @@ notify:                            # where "now" emails and digests go
   # token_env: PUSHOVER_TOKEN
   # user_env: PUSHOVER_USER
 
-# ops_notify: {...}                # optional: where "account offline" alerts go (default: notify)
+# ops_notify: {...}                # optional: where ops alerts go ("account offline", "sorting paused"; default: notify)
+#   e.g. {type: webhook, url: https://ops-bot.example/hook, secret_env: OPS_WEBHOOK_SECRET}  (Standard Webhooks)
 
 deadman:                           # optional: an external monitor that alerts when this goes quiet
   style: kuma                      # kuma (Uptime Kuma push monitor) | healthchecks (healthchecks.io)

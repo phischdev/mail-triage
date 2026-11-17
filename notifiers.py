@@ -4,9 +4,13 @@
   normal  the daily digest, ops problems   (worth a sound)
   low     the weekly roll-up               (silent)
 """
+import base64
+import hashlib
+import hmac
 import json
 import logging
 import os
+import time
 import urllib.parse
 import urllib.request
 
@@ -82,6 +86,32 @@ class Pushover(Notifier):
               {}, form=True)
 
 
+def post_signed(url, body, secret, msg_id):
+    """POST JSON signed the Standard Webhooks way: webhook-id, webhook-timestamp and
+    webhook-signature "v1,<base64 HMAC-SHA256 of id.timestamp.body>". A secret "whsec_<base64>"
+    is used base64-decoded, any other string as is."""
+    key = base64.b64decode(secret[6:]) if secret.startswith("whsec_") else secret.encode()
+    data = json.dumps(body, ensure_ascii=False).encode()
+    ts = str(int(time.time()))
+    sig = base64.b64encode(hmac.new(key, f"{msg_id}.{ts}.".encode() + data, hashlib.sha256).digest()).decode()
+    req = urllib.request.Request(url, data, {"Content-Type": "application/json", "webhook-id": msg_id,
+                                             "webhook-timestamp": ts, "webhook-signature": f"v1,{sig}"})
+    urllib.request.urlopen(req, timeout=10).read()
+
+
+class Webhook(Notifier):
+    """type: webhook. POSTs {title, message, level, url} to `url`, signed per Standard Webhooks with
+    the secret in `secret_env`; for an assistant or ops bot that should act on it."""
+
+    def _send(self, title, message, level, url):
+        secret = self.secret("secret_env")
+        if not secret:
+            raise RuntimeError(f"no secret in {self.cfg.get('secret_env')}")
+        body = {"title": title, "message": message, "level": level, **({"url": url} if url else {})}
+        msg_id = "msg_" + hashlib.sha256(f"{title}|{message}|{int(time.time()) // 60}".encode()).hexdigest()[:32]
+        post_signed(self.cfg["url"], body, secret, msg_id)
+
+
 class Log(Notifier):
     """type: none. Logs what would have been pushed; handy for a first dry run."""
 
@@ -89,7 +119,7 @@ class Log(Notifier):
         log.info("[notify %s] %s | %s", level, title, message.replace("\n", " / ")[:300])
 
 
-TYPES = {"gotify": Gotify, "ntfy": Ntfy, "pushover": Pushover, "none": Log}
+TYPES = {"gotify": Gotify, "ntfy": Ntfy, "pushover": Pushover, "webhook": Webhook, "none": Log}
 
 
 def make(cfg):

@@ -9,6 +9,23 @@ SDKs are imported lazily, so only the one you use has to be installed.
 """
 import json
 import os
+import time
+
+
+class Paused(Exception):
+    """The model service refuses for a long while (spend cap reached, quota used up): stop sorting
+    for now instead of sleeping for hours inside the SDK or giving up on the message."""
+
+    def __init__(self, message, retry_after=None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+def _retry_after(err):
+    try:
+        return float(err.response.headers.get("retry-after"))
+    except Exception:
+        return None
 
 
 class Provider:
@@ -49,18 +66,29 @@ class Anthropic(Provider):
     def classify(self, system, user, schema):
         import anthropic
         if self._client is None:
-            self._client = anthropic.Anthropic(api_key=self.api_key)
+            # Own retries: the SDK honours any Retry-After, and a spend cap answers with hours (2026-11-17).
+            self._client = anthropic.Anthropic(api_key=self.api_key, max_retries=0)
         output_config = {"format": {"type": "json_schema", "schema": schema}}
         if self.cfg.get("effort"):
             output_config["effort"] = self.cfg["effort"]
         kw = {"model": self.model, "max_tokens": 4000, "system": system,
               "messages": [{"role": "user", "content": user}], "output_config": output_config}
-        if self.cfg.get("fallbacks"):
-            # "default": if a safety classifier declines, the API reruns the request on another model
-            resp = self._client.beta.messages.create(
-                **kw, betas=["server-side-fallback-2026-07-01"], fallbacks=self.cfg["fallbacks"])
-        else:
-            resp = self._client.messages.create(**kw)
+        for attempt in range(4):
+            try:
+                if self.cfg.get("fallbacks"):
+                    # "default": if a safety classifier declines, the API reruns the request on another model
+                    resp = self._client.beta.messages.create(
+                        **kw, betas=["server-side-fallback-2026-07-01"], fallbacks=self.cfg["fallbacks"])
+                else:
+                    resp = self._client.messages.create(**kw)
+                break
+            except (anthropic.RateLimitError, anthropic.InternalServerError, anthropic.APIConnectionError) as e:
+                wait = _retry_after(e)
+                if isinstance(e, anthropic.RateLimitError) and (wait is None or wait > 120):
+                    raise Paused(f"model service refuses (429): {e}", wait) from e
+                if attempt == 3:
+                    raise
+                time.sleep(min(wait or 2 ** attempt, 60))
         if resp.stop_reason != "end_turn":
             raise RuntimeError(f"claude stop_reason={resp.stop_reason}")
         return json.loads(next(b.text for b in resp.content if b.type == "text"))

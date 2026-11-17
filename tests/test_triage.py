@@ -459,3 +459,66 @@ def test_export_webhook_never_posts_for_review_or_without_secret(env, monkeypatc
     monkeypatch.setenv("MISSING", "s3cret")
     triage.export_webhook({"tier": "now", "review": True, "account": "a", "msgid": "<m>"})
     assert sent == []
+
+
+def test_a_spend_cap_pauses_sorting_without_marking_or_losing_the_message(env, monkeypatch):
+    import providers
+    triage, llm, notify = env
+    a = triage.Account({"user": "a@x.com", "host": "h", "password_env": "P"})
+    c = WatchIMAP({"INBOX": {}})
+    a.process_new(c)                       # cursor starts at "now"
+    c.raw_by_folder["INBOX"][7] = RAW
+    def refuse(system, user, schema):
+        raise providers.Paused("budget exceeded", 29064)
+    monkeypatch.setattr(llm, "classify", refuse)
+    a.process_new(c)
+    a.process_new(c)                       # still paused: no second model call, no second alert
+    assert triage.q("SELECT COUNT(*) FROM messages")[0][0] == 0          # nothing recorded as unsorted
+    assert triage.q("SELECT last_uid FROM cursor WHERE account=?", "a@x.com")[0][0] == 0
+    assert [s for s in notify.sent if "paused" in str(s)].__len__() == 1
+    monkeypatch.undo()
+    triage.PAUSED["until"] = 0             # the pause is over: the waiting message is sorted
+    a.process_new(c)
+    assert triage.q("SELECT COUNT(*) FROM messages")[0][0] == 1
+    assert triage.q("SELECT last_uid FROM cursor WHERE account=?", "a@x.com")[0][0] == 7
+
+
+def test_anthropic_provider_turns_a_long_429_into_a_pause(monkeypatch):
+    import anthropic
+    import httpx
+    import pytest
+
+    import providers
+    p = providers.Anthropic({"model": "m", "api_key_env": "X"})
+    resp = httpx.Response(429, headers={"retry-after": "29064"}, request=httpx.Request("POST", "http://x"))
+    class Msgs:
+        def create(self, **kw):
+            raise anthropic.RateLimitError("budget exceeded", response=resp, body=None)
+    class Client:
+        messages = Msgs()
+    p._client = Client()
+    with pytest.raises(providers.Paused) as e:
+        p.classify("s", "u", {})
+    assert e.value.retry_after == 29064
+
+
+def test_webhook_notifier_signs_ops_alerts(monkeypatch):
+    import base64
+    import hashlib
+    import hmac
+    import json
+
+    import notifiers
+    monkeypatch.setenv("OPS_SECRET", "plain-secret")
+    sent = []
+    class Resp:
+        def read(self):
+            return b""
+    monkeypatch.setattr(notifiers.urllib.request, "urlopen", lambda req, timeout: sent.append(req) or Resp())
+    n = notifiers.make({"type": "webhook", "url": "https://ops.example/hook", "secret_env": "OPS_SECRET"})
+    assert n.send("mail-triage: sorting paused", "spend cap", "normal")
+    h = {k.lower(): v for k, v in sent[0].header_items()}
+    assert json.loads(sent[0].data) == {"title": "mail-triage: sorting paused", "message": "spend cap", "level": "normal"}
+    want = base64.b64encode(hmac.new(b"plain-secret", f"{h['webhook-id']}.{h['webhook-timestamp']}.".encode()
+                                     + sent[0].data, hashlib.sha256).digest()).decode()
+    assert h["webhook-signature"] == f"v1,{want}"
