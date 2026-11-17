@@ -76,6 +76,7 @@ body_chars: 2500                   # how much of each body the model sees
 #   url: https://assistant.example/webhooks/mail
 #   secret_env: EXPORT_WEBHOOK_SECRET
 #   tiers: [now, today]
+#   categories: [confirmation]      # optional: also post these categories at any tier
 # Optional: your secretary. Mail that asks you to do something becomes a to-do, appointments
 # and bookings become calendar events, on any CalDAV server (Radicale, Nextcloud, Fastmail...).
 # Ticking a to-do off in your app marks its email read (secretary.py).

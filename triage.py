@@ -769,9 +769,12 @@ def export_webhook(rec):
         url: https://assistant.example/webhooks/mail
         secret_env: EXPORT_WEBHOOK_SECRET   # "whsec_<base64>" or any string
         tiers: [now, today]                 # default; review runs never post
+        categories: [confirmation]          # optional: also these categories, whatever the tier
     Failures are logged, never raised: the export file stays the record to catch up from."""
     cfg = CFG.get("export_webhook")
-    if not cfg or rec.get("review") or rec["tier"] not in cfg.get("tiers", ["now", "today"]):
+    if not cfg or rec.get("review"):
+        return
+    if rec["tier"] not in cfg.get("tiers", ["now", "today"]) and rec.get("category") not in cfg.get("categories", []):
         return
     secret = os.environ.get(cfg.get("secret_env", ""), "")
     if not secret:

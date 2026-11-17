@@ -524,3 +524,20 @@ def test_webhook_notifier_signs_ops_alerts(monkeypatch):
     want = base64.b64encode(hmac.new(b"plain-secret", f"{h['webhook-id']}.{h['webhook-timestamp']}.".encode()
                                      + sent[0].data, hashlib.sha256).digest()).decode()
     assert h["webhook-signature"] == f"v1,{want}"
+
+
+def test_export_webhook_also_posts_listed_categories_at_any_tier(env, monkeypatch):
+    triage, llm, notify = env
+    monkeypatch.setenv("HOOK_SECRET", "s3cret")
+    triage.CFG["export_webhook"] = {"url": "https://assistant.example/hook", "secret_env": "HOOK_SECRET",
+                                    "categories": ["bestaetigung"]}
+    sent = []
+    class Resp:
+        def read(self):
+            return b""
+    monkeypatch.setattr(triage.urllib.request, "urlopen", lambda req, timeout: sent.append(req) or Resp())
+    base = {"review": False, "account": "a", "msgid": "<m>"}
+    triage.export_webhook({**base, "tier": "later", "category": "news"})
+    assert sent == []
+    triage.export_webhook({**base, "tier": "later", "category": "bestaetigung"})
+    assert len(sent) == 1
