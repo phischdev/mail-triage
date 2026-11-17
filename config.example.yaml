@@ -70,11 +70,11 @@ later_folder: Later
 #   token_env: TRIAGE_ACTIONS_TOKEN  # Authorization: Bearer <token> on every request
 body_chars: 2500                   # how much of each body the model sees
 # export_dir: /export               # optional: every decision as one JSON line in <dir>/YYYY-MM-DD.jsonl
+                                   # (no body; for an assistant or dashboard that should see verdicts only)
 # export_webhook:                   # optional: POST each now/today decision as it happens (Standard Webhooks signature)
 #   url: https://assistant.example/webhooks/mail
 #   secret_env: EXPORT_WEBHOOK_SECRET
 #   tiers: [now, today]
-                                   # (no body; for an assistant or dashboard that should see verdicts only)
 # Optional: your secretary. Mail that asks you to do something becomes a to-do, appointments
 # and bookings become calendar events, on any CalDAV server (Radicale, Nextcloud, Fastmail...).
 # Ticking a to-do off in your app marks its email read (secretary.py).
