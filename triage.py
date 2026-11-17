@@ -894,7 +894,15 @@ def cmd_review(days=60, account=None, *folders):
             uids = sorted(c.search(["SINCE", since]))
             log.info("review %s %s: %d messages since %s", spec["user"], folder, len(uids), since)
             for uid in uids:
-                raw = c.fetch([uid], ["BODY.PEEK[]<0.300000>"]).get(uid, {})
+                try:
+                    raw = c.fetch([uid], ["BODY.PEEK[]<0.300000>"]).get(uid, {})
+                except (IMAPClient.AbortError, OSError) as e:
+                    # A long review outlives the server session (Outlook OAuth: about an hour,
+                    # "AccessTokenExpired"). Log in again and carry on where it stopped.
+                    log.warning("review: connection lost in %s (%s), logging in again", folder, e)
+                    c = a.connect()
+                    c.select_folder(folder, readonly=True)
+                    raw = c.fetch([uid], ["BODY.PEEK[]<0.300000>"]).get(uid, {})
                 raw = raw.get(b"BODY[]<0>") or next((v for k, v in raw.items() if k.startswith(b"BODY[")), b"")
                 if raw:
                     try:

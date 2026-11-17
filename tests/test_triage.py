@@ -401,3 +401,19 @@ def test_review_sorts_old_mail_once_without_moving_or_pushing(env, tmp_path, mon
     assert c.moves == [] and c.flags == [] and not notify.sent and len(llm.calls) == 1
     rec = json.loads(next((tmp_path / "export").glob("*.jsonl")).read_text().splitlines()[0])
     assert rec["review"] is True and rec["tier"] == "now"
+
+
+def test_review_logs_in_again_when_the_session_expires(env, tmp_path, monkeypatch):
+    from imapclient import IMAPClient
+    triage, llm, notify = env
+    triage.CFG["export_dir"] = tmp_path / "export"
+    expired, fresh = WatchIMAP({"INBOX": {3: RAW}}), WatchIMAP({"INBOX": {3: RAW}})
+    def fail(uids, parts):
+        raise IMAPClient.AbortError("FETCH => Session invalidated - AccessTokenExpired")
+    expired.fetch = fail
+    conns = iter([expired, fresh])
+    monkeypatch.setattr(triage.Account, "connect", lambda self: next(conns))
+    monkeypatch.setattr(triage.Account, "refresh_contacts", lambda self, c: None)
+    fresh.logout = lambda: None
+    triage.cmd_review(60)
+    assert len(llm.calls) == 1 and ("INBOX", True) in fresh.selected
