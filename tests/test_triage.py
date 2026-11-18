@@ -588,7 +588,8 @@ def test_export_webhook_hermes_run_retries_busy_then_gives_up(env, monkeypatch):
 def test_review_again_post_resorts_and_hands_old_mail_to_hermes_one_run_at_a_time(env, tmp_path, monkeypatch):
     import json
     triage, llm, notify = env
-    monkeypatch.setattr(triage, "REVIEW_POST", False)   # cmd_review sets it; restored afterwards
+    monkeypatch.setattr(triage, "REVIEW_POST", False)   # cmd_review sets these; restored afterwards
+    monkeypatch.setattr(triage, "REVIEW_RUN", "")
     monkeypatch.setenv("HERMES_KEY", "k" * 32)
     triage.CFG["export_webhook"] = {"type": "hermes_run", "url": "http://hermes:8642/p/inbox/v1/runs",
                                     "key_env": "HERMES_KEY", "session_key": "mail-eingang",
@@ -622,7 +623,8 @@ def test_review_again_post_resorts_and_hands_old_mail_to_hermes_one_run_at_a_tim
     assert next(polls, None) is None           # waited until the run had finished
     text = json.loads(sent[0].data)["input"]
     assert "Nachtest: kein Push." in text and '"review": true' in text
-    assert {k.lower(): v for k, v in sent[0].header_items()}["idempotency-key"].startswith("review-")
+    key = {k.lower(): v for k, v in sent[0].header_items()}["idempotency-key"]
+    assert key.startswith("review-" + triage.REVIEW_RUN + "-")   # a later review posts it again
     assert triage.q("SELECT tier FROM messages")[0][0] == "later"   # the stored verdict stays
     assert c.moves == [] and c.flags == [] and not notify.sent
 

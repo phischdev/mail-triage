@@ -75,6 +75,7 @@ OPS = None
 _db = None
 _lock = threading.Lock()
 REVIEW_POST = False   # cmd_review --post: review decisions go to export_webhook too
+REVIEW_RUN = ""       # cmd_review: when this review started, so a later review posts the same mail again
 LAST_OK = {}             # account -> time of its last completed IMAP cycle (dead-man input)
 STARTED = time.time()
 
@@ -822,7 +823,7 @@ def export_hermes_run(cfg, rec):
             f"{json.dumps(rec, ensure_ascii=False, indent=1)}\nMAIL>>>")
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {key}",
                "X-Hermes-Session-Key": cfg.get("session_key", "mail-triage"),
-               "Idempotency-Key": ("review-" if rec.get("review") else "mail-")
+               "Idempotency-Key": (f"review-{REVIEW_RUN}-" if rec.get("review") else "mail-")
                + hashlib.sha256((rec["account"] + rec["msgid"]).encode()).hexdigest()[:40]}
     data = json.dumps({"input": text}, ensure_ascii=False).encode()
     for attempt in range(4):
@@ -1002,12 +1003,13 @@ def cmd_try(user, n=10):
 
 def cmd_review(*args):
     """review [--again] [--post] [DAYS] [ACCOUNT] [FOLDER...]: see _review."""
-    global REVIEW_POST
+    global REVIEW_POST, REVIEW_RUN
     args = [str(a) for a in args]
     flags = {a for a in args if a.startswith("--")}
     if flags - {"--again", "--post"}:
         raise SystemExit(f"review: unknown option {', '.join(sorted(flags - {'--again', '--post'}))}")
     REVIEW_POST = "--post" in flags
+    REVIEW_RUN = now().strftime("%Y%m%dT%H%M%S")
     return _review(*[a for a in args if not a.startswith("--")], again="--again" in flags)
 
 
