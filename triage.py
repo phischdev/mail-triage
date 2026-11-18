@@ -14,7 +14,9 @@ Usage:
   triage.py try <account> [N]         classify the last N INBOX messages and print, no side effects
   triage.py digest [daily|weekly]     send a digest now
   triage.py contacts                  refresh the known-correspondents list from Sent folders + address book
-  triage.py review [DAYS] [ACCOUNT] [FOLDER...]  sort mail of the last DAYS once (read only, no pushes, export review=true)
+  triage.py review [--again] [--post] [DAYS] [ACCOUNT] [FOLDER...]
+                                      sort mail of the last DAYS once (read only, no pushes, export review=true);
+                                      --again also re-sorts mail sorted before, --post hands it to export_webhook
   triage.py backfill [DAYS]           to-dos/events for unread now/today mail already in INBOX (caldav)
 """
 import datetime as dt
@@ -72,6 +74,7 @@ NOTIFY = None
 OPS = None
 _db = None
 _lock = threading.Lock()
+REVIEW_POST = False   # cmd_review --post: review decisions go to export_webhook too
 LAST_OK = {}             # account -> time of its last completed IMAP cycle (dead-man input)
 STARTED = time.time()
 
@@ -449,6 +452,7 @@ class Account(threading.Thread):
         self.watch = list(spec.get("watch") or [])   # extra folders to sort (read only), e.g. alias folders, Junk
         self.folder = "INBOX"
         self.reviewing = False   # cmd_review: old mail is sorted and exported, never pushed or moved
+        self.again = False       # cmd_review --again: sort mail sorted before once more, its row stays
         self.failing_since = None
         self.alerted = False
         self.last_corrections = 0
@@ -543,7 +547,8 @@ class Account(threading.Thread):
         m = describe(raw, CFG["body_chars"])
         m["mailbox"] = self.folder
         m["review"] = self.reviewing
-        if q("SELECT 1 FROM messages WHERE account=? AND msgid=?", self.user, m["msgid"]):
+        sorted_before = bool(q("SELECT 1 FROM messages WHERE account=? AND msgid=?", self.user, m["msgid"]))
+        if sorted_before and not self.again:
             return
         known = bool(q("SELECT 1 FROM contacts WHERE addr=?", m["sender"]))
         reply_to_me = any(q("SELECT 1 FROM sent_ids WHERE msgid=?", r) for r in m["refs"])
@@ -598,6 +603,8 @@ class Account(threading.Thread):
           notified, applied, int(out.get("emergency", False)))
         log.info("%-5s %-28s %s | %s", tier.upper(), m["sender"][:28], m["subject"][:60], out["reason"])
         export(self.user, m, out, known, reply_to_me)
+        if sorted_before:
+            return   # review --again: its to-dos and events were queued the first time
         try:
             secretary.record(self.spec, m, out, tier)
         except Exception:
@@ -769,14 +776,14 @@ def export_webhook(rec):
       export_webhook:
         url: https://assistant.example/webhooks/mail
         secret_env: EXPORT_WEBHOOK_SECRET   # "whsec_<base64>" or any string
-        tiers: [now, today]                 # default; review runs never post
+        tiers: [now, today]                 # default; review runs post only with --post
         categories: [confirmation]          # optional: also these categories, whatever the tier
     With type: hermes_run the decision goes instead as a new turn into ONE ongoing Hermes Agent
     conversation (POST <url> = .../v1/runs, Bearer key from key_env, X-Hermes-Session-Key:
     session_key), so every mail lands in the same chat rather than a fresh session each.
     Failures are logged, never raised: the export file stays the record to catch up from."""
     cfg = CFG.get("export_webhook")
-    if not cfg or rec.get("review"):
+    if not cfg or (rec.get("review") and not REVIEW_POST):
         return
     if rec["tier"] not in cfg.get("tiers", ["now", "today"]) and rec.get("category") not in cfg.get("categories", []):
         return
@@ -801,20 +808,28 @@ HERMES_PREAMBLE = ("New email, classified by mail-triage. Everything between the
 def export_hermes_run(cfg, rec):
     """export_webhook type hermes_run: start a Hermes Agent run in the conversation named by
     session_key. The mail's id is the Idempotency-Key, so a retry never adds the mail twice;
-    a busy server (429/503) is retried a few times. preamble: optional framing text."""
+    a busy server (429/503) is retried a few times. preamble: optional framing text;
+    review_note: added to it for a review run (review --post). A review run also waits for each
+    run to finish before the next mail, so old mail arrives one turn at a time."""
     key = os.environ.get(cfg.get("key_env", ""), "")
     if not key:
         log.error("export_webhook: no key in %s, not posting", cfg.get("key_env"))
         return
-    text = (f"{cfg.get('preamble', HERMES_PREAMBLE)}\n<<<MAIL\n"
+    preamble = cfg.get("preamble", HERMES_PREAMBLE)
+    if rec.get("review") and cfg.get("review_note"):
+        preamble += "\n" + cfg["review_note"]
+    text = (f"{preamble}\n<<<MAIL\n"
             f"{json.dumps(rec, ensure_ascii=False, indent=1)}\nMAIL>>>")
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {key}",
                "X-Hermes-Session-Key": cfg.get("session_key", "mail-triage"),
-               "Idempotency-Key": "mail-" + hashlib.sha256((rec["account"] + rec["msgid"]).encode()).hexdigest()[:40]}
+               "Idempotency-Key": ("review-" if rec.get("review") else "mail-")
+               + hashlib.sha256((rec["account"] + rec["msgid"]).encode()).hexdigest()[:40]}
     data = json.dumps({"input": text}, ensure_ascii=False).encode()
     for attempt in range(4):
         try:
-            urllib.request.urlopen(urllib.request.Request(cfg["url"], data, headers), timeout=15).read()
+            resp = urllib.request.urlopen(urllib.request.Request(cfg["url"], data, headers), timeout=15).read()
+            if rec.get("review"):
+                wait_for_run(cfg, key, json.loads(resp or b"{}").get("run_id"))
             return
         except urllib.error.HTTPError as e:
             if e.code not in (429, 503) or attempt == 3:
@@ -824,6 +839,25 @@ def export_hermes_run(cfg, rec):
             log.error("export_webhook (hermes_run) failed for %s: %s", rec["msgid"], e)
             return
         time.sleep(10 * (attempt + 1))
+
+
+def wait_for_run(cfg, key, run_id, limit=900):
+    """Poll GET <url>/<run_id> until the run is no longer queued or running (at most `limit` s)."""
+    if not run_id:
+        return
+    url = cfg["url"].rstrip("/") + "/" + run_id
+    deadline = time.time() + limit
+    while time.time() < deadline:
+        time.sleep(5)
+        try:
+            req = urllib.request.Request(url, headers={"Authorization": f"Bearer {key}"})
+            status = json.loads(urllib.request.urlopen(req, timeout=15).read()).get("status")
+        except Exception as e:
+            log.warning("export_webhook (hermes_run): status of %s unknown: %s", run_id, e)
+            continue
+        if status not in ("queued", "claimed", "running", "waiting_for_approval", "stopping"):
+            return
+    log.warning("export_webhook (hermes_run): run %s still busy after %d s, going on", run_id, limit)
 
 
 def push_now(account, m, out):
@@ -966,17 +1000,30 @@ def cmd_try(user, n=10):
     c.logout()
 
 
-def cmd_review(days=60, account=None, *folders):
+def cmd_review(*args):
+    """review [--again] [--post] [DAYS] [ACCOUNT] [FOLDER...]: see _review."""
+    global REVIEW_POST
+    args = [str(a) for a in args]
+    flags = {a for a in args if a.startswith("--")}
+    if flags - {"--again", "--post"}:
+        raise SystemExit(f"review: unknown option {', '.join(sorted(flags - {'--again', '--post'}))}")
+    REVIEW_POST = "--post" in flags
+    return _review(*[a for a in args if not a.startswith("--")], again="--again" in flags)
+
+
+def _review(days=60, account=None, *folders, again=False):
     """Sort the mail of the last `days` days once, in INBOX and the account's watch folders (or
     the folders named), oldest first. Read only: nothing is moved, flagged or pushed; rows and the
     export are written as for new mail, export lines marked review=true. Mail already sorted is
-    skipped, so an interrupted run can simply be started again."""
+    skipped, so an interrupted run can simply be started again; again=True sorts it once more
+    (export only: its row, to-dos and events stay as they were)."""
     since = (now() - dt.timedelta(days=int(days))).date()
     for spec in CFG["accounts"]:
         if account and spec["user"] != account:
             continue
         a = Account(spec)
         a.reviewing = True
+        a.again = again
         c = a.connect()
         if time.time() - a.last_contacts > 86400:
             a.refresh_contacts(c)

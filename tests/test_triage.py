@@ -583,3 +583,52 @@ def test_export_webhook_hermes_run_retries_busy_then_gives_up(env, monkeypatch):
     calls.clear()
     triage.export_webhook({"review": False, "account": "a", "msgid": "<m>", "tier": "now"})
     assert calls == []
+
+
+def test_review_again_post_resorts_and_hands_old_mail_to_hermes_one_run_at_a_time(env, tmp_path, monkeypatch):
+    import json
+    triage, llm, notify = env
+    monkeypatch.setattr(triage, "REVIEW_POST", False)   # cmd_review sets it; restored afterwards
+    monkeypatch.setenv("HERMES_KEY", "k" * 32)
+    triage.CFG["export_webhook"] = {"type": "hermes_run", "url": "http://hermes:8642/p/inbox/v1/runs",
+                                    "key_env": "HERMES_KEY", "session_key": "mail-eingang",
+                                    "review_note": "Nachtest: kein Push."}
+    c = WatchIMAP({"INBOX": {3: RAW}, "adm": {}})
+    monkeypatch.setattr(triage.Account, "connect", lambda self: c)
+    monkeypatch.setattr(triage.Account, "refresh_contacts", lambda self, c: None)
+    c.logout = lambda: None
+    recorded = []
+    monkeypatch.setattr(triage.secretary, "record", lambda *a: recorded.append(a))
+    monkeypatch.setattr(triage.time, "sleep", lambda s: None)
+    sent, polls = [], iter([b'{"status": "running"}', b'{"status": "completed"}'])
+    class Resp:
+        def __init__(self, body):
+            self.body = body
+        def read(self):
+            return self.body
+    def urlopen(req, timeout):
+        if req.get_method() == "POST":
+            sent.append(req)
+            return Resp(b'{"run_id": "run_1", "status": "queued"}')
+        assert req.full_url.endswith("/v1/runs/run_1")
+        return Resp(next(polls))
+    monkeypatch.setattr(triage.urllib.request, "urlopen", urlopen)
+    llm.reply.update(tier="later")
+    triage.cmd_review(60)                      # first sort: later, nothing posted, to-dos queued
+    assert sent == [] and len(recorded) == 1
+    llm.reply.update(tier="today")
+    triage.cmd_review("--again", "--post", "7")
+    assert len(llm.calls) == 2 and len(sent) == 1 and len(recorded) == 1   # no second to-do
+    assert next(polls, None) is None           # waited until the run had finished
+    text = json.loads(sent[0].data)["input"]
+    assert "Nachtest: kein Push." in text and '"review": true' in text
+    assert {k.lower(): v for k, v in sent[0].header_items()}["idempotency-key"].startswith("review-")
+    assert triage.q("SELECT tier FROM messages")[0][0] == "later"   # the stored verdict stays
+    assert c.moves == [] and c.flags == [] and not notify.sent
+
+
+def test_review_rejects_unknown_options(env):
+    import pytest
+    triage, llm, notify = env
+    with pytest.raises(SystemExit):
+        triage.cmd_review("--pots")
